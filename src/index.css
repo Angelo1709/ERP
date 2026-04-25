@@ -1,0 +1,29 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Inter", "Segoe UI", Roboto, sans-serif;
+  background: #f8fafc;
+  color: #111827;
+}
+
+input.compact-number::-webkit-outer-spin-button,
+input.compact-number::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input.compact-number {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
