@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
 const PORT = Number(process.env.PORT || 4000);
 const HOST = String(
@@ -14,10 +16,21 @@ const CORS_ORIGIN = String(process.env.CORS_ORIGIN || process.env.ERP_CORS_ORIGI
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.ERP_DATA_DIR || path.resolve(__dirname, "..", "data"));
 const LIVE_DIR = path.join(DATA_DIR, "live");
+const DIST_DIR = path.resolve(__dirname, "..", "dist");
+const DIST_INDEX = path.join(DIST_DIR, "index.html");
 const DB_PATH = path.join(DATA_DIR, "erp.sqlite");
 const STATE_JSON_PATH = path.join(DATA_DIR, "app-state.json");
 const STORAGE_PREF = String(process.env.ERP_STORAGE || "auto").trim().toLowerCase();
 const TABLES = ["operaciones", "facturas", "remitos", "recibos", "compras", "clientes", "proveedores", "productos", "vendedores", "costos"];
+const USERS_JSON_PATH = path.join(DATA_DIR, "users.json");
+const AUDIT_JSON_PATH = path.join(DATA_DIR, "audit.json");
+const JWT_SECRET = (() => {
+  const s = (process.env.JWT_SECRET || "").trim();
+  if (!s) console.warn("[erp-api] ADVERTENCIA: JWT_SECRET no configurado. Usá una clave segura en producción.");
+  return s || "dev-insecure-cambiar-en-produccion";
+})();
+const JWT_EXPIRY = process.env.JWT_EXPIRY || "8h";
+const VALID_ROLES = ["ADMIN", "VENDEDOR"];
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(LIVE_DIR, { recursive: true });
@@ -75,6 +88,31 @@ async function initMySql() {
         id TINYINT UNSIGNED PRIMARY KEY,
         payload LONGTEXT NOT NULL,
         updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    await mysqlPool.query(`
+      CREATE TABLE IF NOT EXISTS erp_users (
+        id VARCHAR(36) PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        nombre VARCHAR(200) NOT NULL DEFAULT '',
+        role ENUM('ADMIN','VENDEDOR') NOT NULL DEFAULT 'VENDEDOR',
+        active TINYINT(1) NOT NULL DEFAULT 1,
+        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+    await mysqlPool.query(`
+      CREATE TABLE IF NOT EXISTS erp_audit (
+        id VARCHAR(60) PRIMARY KEY,
+        timestamp VARCHAR(30) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        user_name VARCHAR(200) NOT NULL DEFAULT '',
+        user_role VARCHAR(20) NOT NULL DEFAULT '',
+        action VARCHAR(20) NOT NULL,
+        entity VARCHAR(60) NOT NULL,
+        entity_id VARCHAR(100) NOT NULL DEFAULT '',
+        detail TEXT
       )
     `);
 
@@ -197,6 +235,124 @@ async function saveState(data) {
   return updatedAt;
 }
 
+// ─── USUARIOS ────────────────────────────────────────────────────────────────
+
+function newUserId() {
+  return `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function readUsers() {
+  if (storageMode === "mysql" && mysqlPool) {
+    const [rows] = await mysqlPool.query("SELECT * FROM erp_users ORDER BY created_at ASC");
+    return (Array.isArray(rows) ? rows : []).map((r) => ({
+      id: r.id, username: r.username, passwordHash: r.password_hash,
+      nombre: r.nombre, role: r.role, active: Boolean(r.active), createdAt: r.created_at,
+    }));
+  }
+  if (!fs.existsSync(USERS_JSON_PATH)) return [];
+  try { return JSON.parse(fs.readFileSync(USERS_JSON_PATH, "utf8")) || []; } catch { return []; }
+}
+
+async function saveUser(u) {
+  if (storageMode === "mysql" && mysqlPool) {
+    await mysqlPool.query(`
+      INSERT INTO erp_users (id, username, password_hash, nombre, role, active)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE username=VALUES(username), password_hash=VALUES(password_hash),
+        nombre=VALUES(nombre), role=VALUES(role), active=VALUES(active), updated_at=CURRENT_TIMESTAMP
+    `, [u.id, u.username, u.passwordHash, u.nombre || "", u.role, u.active ? 1 : 0]);
+    return;
+  }
+  const all = await readUsers();
+  const idx = all.findIndex((x) => x.id === u.id);
+  if (idx >= 0) all[idx] = u; else all.push(u);
+  fs.writeFileSync(USERS_JSON_PATH, JSON.stringify(all, null, 2), "utf8");
+}
+
+async function findUserByUsername(username) {
+  const all = await readUsers();
+  return all.find((u) => u.username.toLowerCase() === username.toLowerCase()) || null;
+}
+
+async function findUserById(id) {
+  const all = await readUsers();
+  return all.find((u) => u.id === id) || null;
+}
+
+async function hasAnyUser() {
+  const all = await readUsers();
+  return all.length > 0;
+}
+
+// ─── TOKEN ───────────────────────────────────────────────────────────────────
+
+function signToken(user) {
+  return jwt.sign(
+    { sub: user.id, username: user.username, nombre: user.nombre, role: user.role },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRY },
+  );
+}
+
+async function requireAuth(req) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : null;
+  if (!token) return null;
+  let payload;
+  try { payload = jwt.verify(token, JWT_SECRET); } catch { return null; }
+  if (!payload?.sub) return null;
+  const user = await findUserById(payload.sub);
+  if (!user || !user.active) return null;
+  return { id: user.id, username: user.username, nombre: user.nombre, role: user.role };
+}
+
+// ─── AUDITORÍA ───────────────────────────────────────────────────────────────
+
+async function appendAudit(user, action, entity, entityId, detail) {
+  const entry = {
+    id: `al_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: nowIso(),
+    userId: user.id,
+    userName: user.nombre || user.username,
+    userRole: user.role,
+    action,
+    entity,
+    entityId: String(entityId || ""),
+    detail: String(detail || ""),
+  };
+  if (storageMode === "mysql" && mysqlPool) {
+    await mysqlPool.query(
+      "INSERT INTO erp_audit (id,timestamp,user_id,user_name,user_role,action,entity,entity_id,detail) VALUES (?,?,?,?,?,?,?,?,?)",
+      [entry.id, entry.timestamp, entry.userId, entry.userName, entry.userRole, entry.action, entry.entity, entry.entityId, entry.detail],
+    );
+    return;
+  }
+  let logs = [];
+  if (fs.existsSync(AUDIT_JSON_PATH)) {
+    try { logs = JSON.parse(fs.readFileSync(AUDIT_JSON_PATH, "utf8")) || []; } catch { logs = []; }
+  }
+  logs.push(entry);
+  if (logs.length > 10000) logs = logs.slice(-10000);
+  fs.writeFileSync(AUDIT_JSON_PATH, JSON.stringify(logs, null, 2), "utf8");
+}
+
+async function readAuditLogs(limit = 500) {
+  if (storageMode === "mysql" && mysqlPool) {
+    const [rows] = await mysqlPool.query(
+      "SELECT * FROM erp_audit ORDER BY timestamp DESC LIMIT ?", [limit],
+    );
+    return (Array.isArray(rows) ? rows : []).map((r) => ({
+      id: r.id, timestamp: r.timestamp, userId: r.user_id, userName: r.user_name,
+      userRole: r.user_role, action: r.action, entity: r.entity, entityId: r.entity_id, detail: r.detail,
+    }));
+  }
+  if (!fs.existsSync(AUDIT_JSON_PATH)) return [];
+  try {
+    const all = JSON.parse(fs.readFileSync(AUDIT_JSON_PATH, "utf8")) || [];
+    return all.slice(-limit).reverse();
+  } catch { return []; }
+}
+
 function flattenValue(v) {
   if (v == null) return "";
   if (typeof v === "object") return JSON.stringify(v);
@@ -263,7 +419,7 @@ function localIps() {
 function setCors(res) {
   res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
 }
 
 function sendJson(res, status, payload) {
@@ -278,6 +434,33 @@ function sendText(res, status, contentType, body) {
   res.statusCode = status;
   res.setHeader("Content-Type", contentType);
   res.end(body);
+}
+
+const MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "application/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".txt": "text/plain; charset=utf-8",
+};
+
+function staticContentType(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  return MIME_TYPES[ext] || "application/octet-stream";
+}
+
+function safeStaticPath(urlPath) {
+  const rel = decodeURIComponent(urlPath === "/" ? "/index.html" : urlPath);
+  const clean = path.normalize(rel).replace(/^(\.\.(\/|\\|$))+/, "");
+  const full = path.resolve(DIST_DIR, `.${clean.startsWith("/") || clean.startsWith("\\") ? clean : `/${clean}`}`);
+  if (!full.startsWith(DIST_DIR)) return null;
+  return full;
 }
 
 function sendIqy(res, status, filename, csvUrl) {
@@ -326,35 +509,145 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && pathname === "/api/health") {
       const lan = localIps().map((ip) => `http://${ip}:${PORT}`);
+      return sendJson(res, 200, { ok: true, storage: storageMode, version: "2.0", lan });
+    }
+
+    // ── POST /auth/setup  (solo si no hay usuarios — primer arranque) ────────
+    if (req.method === "POST" && pathname === "/auth/setup") {
+      if (await hasAnyUser()) return sendJson(res, 409, { error: "Ya existe al menos un usuario. Usá la app para crear más." });
+      const body = await readJson(req);
+      const username = String(body?.username || "").trim().toLowerCase();
+      const password = String(body?.password || "");
+      const nombre = String(body?.nombre || "").trim();
+      if (!username || !password || !nombre) return sendJson(res, 400, { error: "Falta usuario, contraseña o nombre." });
+      if (password.length < 6) return sendJson(res, 400, { error: "La contraseña debe tener al menos 6 caracteres." });
+      const passwordHash = await bcrypt.hash(password, 12);
+      const admin = { id: newUserId(), username, passwordHash, nombre, role: "ADMIN", active: true, createdAt: nowIso() };
+      await saveUser(admin);
+      console.log(`[erp-api] Primer usuario ADMIN creado: ${username}`);
+      return sendJson(res, 201, { ok: true, user: { id: admin.id, username, nombre, role: "ADMIN" } });
+    }
+
+    // ── POST /auth/login ─────────────────────────────────────────────────────
+    if (req.method === "POST" && pathname === "/auth/login") {
+      const body = await readJson(req);
+      const username = String(body?.username || "").trim();
+      const password = String(body?.password || "");
+      if (!username || !password) return sendJson(res, 400, { error: "Falta usuario o contraseña." });
+      const user = await findUserByUsername(username);
+      if (!user || !user.active) return sendJson(res, 401, { error: "Usuario o contraseña incorrectos." });
+      const valid = await bcrypt.compare(password, user.passwordHash);
+      if (!valid) return sendJson(res, 401, { error: "Usuario o contraseña incorrectos." });
+      const token = signToken(user);
+      await appendAudit(user, "LOGIN", "sesion", user.id, `Ingreso desde ${req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "?"}`);
+      return sendJson(res, 200, { token, user: { id: user.id, username: user.username, nombre: user.nombre, role: user.role } });
+    }
+
+    // ── GET /auth/me ─────────────────────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/auth/me") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
+      return sendJson(res, 200, { user });
+    }
+
+    // ── GET /auth/users  (solo ADMIN) ────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/auth/users") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
+      if (user.role !== "ADMIN") return sendJson(res, 403, { error: "Solo el administrador puede ver usuarios." });
+      const all = await readUsers();
       return sendJson(res, 200, {
-        ok: true,
-        host: HOST,
-        port: PORT,
-        cors: CORS_ORIGIN,
-        storage: storageMode,
-        db: DB_PATH,
-        jsonState: STATE_JSON_PATH,
-        liveDir: LIVE_DIR,
-        lan,
-        mysql: storageMode === "mysql" ? {
-          host: process.env.MYSQL_HOST || null,
-          port: Number(process.env.MYSQL_PORT || 3306),
-          database: process.env.MYSQL_DATABASE || null,
-          user: process.env.MYSQL_USER || null,
-        } : null,
+        users: all.map((u) => ({ id: u.id, username: u.username, nombre: u.nombre, role: u.role, active: u.active, createdAt: u.createdAt })),
       });
     }
 
+    // ── POST /auth/users  (solo ADMIN) ───────────────────────────────────────
+    if (req.method === "POST" && pathname === "/auth/users") {
+      const actor = await requireAuth(req);
+      if (!actor) return sendJson(res, 401, { error: "No autenticado." });
+      if (actor.role !== "ADMIN") return sendJson(res, 403, { error: "Solo el administrador puede crear usuarios." });
+      const body = await readJson(req);
+      const username = String(body?.username || "").trim().toLowerCase();
+      const password = String(body?.password || "");
+      const nombre = String(body?.nombre || "").trim();
+      const role = String(body?.role || "VENDEDOR").toUpperCase();
+      if (!username || !password || !nombre) return sendJson(res, 400, { error: "Falta usuario, contraseña o nombre." });
+      if (!VALID_ROLES.includes(role)) return sendJson(res, 400, { error: `Rol inválido. Opciones: ${VALID_ROLES.join(", ")}` });
+      if (password.length < 6) return sendJson(res, 400, { error: "La contraseña debe tener al menos 6 caracteres." });
+      const existing = await findUserByUsername(username);
+      if (existing) return sendJson(res, 409, { error: "Ya existe un usuario con ese nombre." });
+      const passwordHash = await bcrypt.hash(password, 12);
+      const newUser = { id: newUserId(), username, passwordHash, nombre, role, active: true, createdAt: nowIso() };
+      await saveUser(newUser);
+      await appendAudit(actor, "CREATE", "usuario", newUser.id, `Creó usuario ${username} (${role})`);
+      return sendJson(res, 201, { ok: true, user: { id: newUser.id, username, nombre, role } });
+    }
+
+    // ── PUT /auth/users/:id  (solo ADMIN) ────────────────────────────────────
+    if (req.method === "PUT" && pathname.startsWith("/auth/users/")) {
+      const actor = await requireAuth(req);
+      if (!actor) return sendJson(res, 401, { error: "No autenticado." });
+      if (actor.role !== "ADMIN") return sendJson(res, 403, { error: "Solo el administrador puede modificar usuarios." });
+      const uid = pathname.replace("/auth/users/", "");
+      const existing = await findUserById(uid);
+      if (!existing) return sendJson(res, 404, { error: "Usuario no encontrado." });
+      const body = await readJson(req);
+      const updated = { ...existing };
+      if (body?.nombre !== undefined) updated.nombre = String(body.nombre).trim();
+      if (body?.role !== undefined) {
+        const r = String(body.role).toUpperCase();
+        if (!VALID_ROLES.includes(r)) return sendJson(res, 400, { error: "Rol inválido." });
+        if (uid === actor.id && r !== "ADMIN") return sendJson(res, 400, { error: "No podés quitarte el rol ADMIN." });
+        updated.role = r;
+      }
+      if (body?.active !== undefined) {
+        if (uid === actor.id) return sendJson(res, 400, { error: "No podés desactivarte a vos mismo." });
+        updated.active = Boolean(body.active);
+      }
+      if (body?.password) {
+        if (String(body.password).length < 6) return sendJson(res, 400, { error: "La contraseña debe tener al menos 6 caracteres." });
+        updated.passwordHash = await bcrypt.hash(String(body.password), 12);
+      }
+      await saveUser(updated);
+      await appendAudit(actor, "UPDATE", "usuario", uid, `Modificó usuario ${existing.username}`);
+      return sendJson(res, 200, { ok: true, user: { id: updated.id, username: updated.username, nombre: updated.nombre, role: updated.role, active: updated.active } });
+    }
+
+    // ── GET /api/audit  (solo ADMIN) ─────────────────────────────────────────
+    if (req.method === "GET" && pathname === "/api/audit") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
+      if (user.role !== "ADMIN") return sendJson(res, 403, { error: "Solo el administrador puede ver el historial." });
+      const limit = Math.min(Number(url.searchParams.get("limit") || 200), 1000);
+      return sendJson(res, 200, { logs: await readAuditLogs(limit) });
+    }
+
+    // ── POST /api/audit  (cualquier usuario autenticado) ─────────────────────
+    if (req.method === "POST" && pathname === "/api/audit") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
+      const body = await readJson(req);
+      const action = String(body?.action || "").trim().toUpperCase();
+      const entity = String(body?.entity || "").trim();
+      const entityId = String(body?.entityId || "");
+      const detail = String(body?.detail || "").slice(0, 500);
+      if (!action || !entity) return sendJson(res, 400, { error: "Falta action o entity." });
+      await appendAudit(user, action, entity, entityId, detail);
+      return sendJson(res, 200, { ok: true });
+    }
+
+    // ── GET /api/state  (requiere login) ─────────────────────────────────────
     if (req.method === "GET" && pathname === "/api/state") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
       const row = await readStateRow();
-      return sendJson(res, 200, {
-        data: row?.data || null,
-        updatedAt: row?.updatedAt || null,
-        source: storageMode,
-      });
+      return sendJson(res, 200, { data: row?.data || null, updatedAt: row?.updatedAt || null, source: storageMode });
     }
 
+    // ── PUT /api/state  (requiere login) ─────────────────────────────────────
     if (req.method === "PUT" && pathname === "/api/state") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
       try {
         const body = await readJson(req);
         if (!body || typeof body.data !== "object" || body.data == null || Array.isArray(body.data)) {
@@ -395,13 +688,15 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && pathname === "/api/ocr/analyze") {
+      const user = await requireAuth(req);
+      if (!user) return sendJson(res, 401, { error: "No autenticado." });
       try {
         const body = await readJson(req);
         const prompt = String(body?.prompt || "").trim();
         const base64 = String(body?.base64 || "").trim();
         const mimeType = String(body?.mimeType || "").trim();
-        const model = String(body?.model || process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514");
-        const apiKey = process.env.ANTHROPIC_API_KEY || process.env.VITE_ANTHROPIC_API_KEY;
+        const model = String(process.env.ANTHROPIC_MODEL || "claude-sonnet-4-20250514");
+        const apiKey = process.env.ANTHROPIC_API_KEY;
 
         if (!apiKey) return sendJson(res, 400, { error: "Falta ANTHROPIC_API_KEY en el servidor." });
         if (!prompt) return sendJson(res, 400, { error: "Falta prompt OCR." });
@@ -469,6 +764,19 @@ const server = createServer(async (req, res) => {
       return sendText(res, 200, "text/csv; charset=utf-8", csv);
     }
 
+    if (req.method === "GET" && fs.existsSync(DIST_INDEX) && !pathname.startsWith("/api/") && !pathname.startsWith("/live/")) {
+      const full = safeStaticPath(pathname);
+      if (full && fs.existsSync(full) && fs.statSync(full).isFile()) {
+        const body = fs.readFileSync(full);
+        return sendText(res, 200, staticContentType(full), body);
+      }
+
+      if (!path.extname(pathname)) {
+        const body = fs.readFileSync(DIST_INDEX);
+        return sendText(res, 200, "text/html; charset=utf-8", body);
+      }
+    }
+
     return sendJson(res, 404, { error: "Ruta no encontrada" });
   } catch (err) {
     return sendJson(res, 500, { error: err?.message || "Fallo interno del servidor" });
@@ -491,6 +799,11 @@ server.listen(PORT, HOST, () => {
     if (ips.length) {
       console.log(`[erp-api] LAN: ${ips.map((ip) => `http://${ip}:${PORT}`).join(" | ")}`);
     }
+  }
+  if (fs.existsSync(DIST_INDEX)) {
+    console.log("[erp-api] web: dist detectado (UI servida por la API).");
+  } else {
+    console.log("[erp-api] web: dist no encontrado (ejecuta `npm run build`).");
   }
   if (CORS_ORIGIN !== "*") {
     console.log(`[erp-api] cors origin: ${CORS_ORIGIN}`);

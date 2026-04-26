@@ -17,10 +17,13 @@
     "migrate:mysql": "node scripts/migrate-to-mysql.mjs",
     "backup:state": "node scripts/backup-state.mjs",
     "restore:state": "node scripts/restore-state.mjs",
+    "create-admin": "node scripts/create-admin.mjs",
     "desktop": "npm run build && electron .",
     "dist:win": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.11.0",
     "mysql2": "^3.22.2",
     "react": "^19.2.5",
