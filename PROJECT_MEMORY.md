@@ -92,3 +92,17 @@ Last update: 2026-04-24 (iteracion funcional UX + reglas comerciales)
   - one/many receipts linked to invoices
 - Design guided workflow to reduce manual errors and make pending amounts explicit.
 - Then implement OCR ingestion pipeline incrementally (upload -> parse -> review -> confirm).
+
+## Infra update (2026-04-25)
+- Proyecto preparado para nube Railway:
+  - `Dockerfile` para API
+  - `railway.json`
+  - script `start` de Node API en `package.json`
+- API robustecida para nube:
+  - host automatico `0.0.0.0` en Railway
+  - `api/health` ahora informa host/port/lan/cors
+- Portabilidad de datos incorporada:
+  - `npm run backup:state` -> genera backup JSON en `backups/`
+  - `npm run restore:state -- <archivo>` -> restaura estado en MySQL
+- Documentacion:
+  - `docs/DEPLOY_RAILWAY.md` con guia paso a paso para deploy, validacion, backup y migracion futura.

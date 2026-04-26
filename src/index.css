@@ -12,9 +12,20 @@ body,
 
 body {
   margin: 0;
-  font-family: "Inter", "Segoe UI", Roboto, sans-serif;
-  background: #f8fafc;
-  color: #111827;
+  font-family: "Inter", "Manrope", "Segoe UI", Roboto, sans-serif;
+  background: #f6f8f5;
+  color: #17211b;
+}
+
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
 }
 
 input.compact-number::-webkit-outer-spin-button,
@@ -24,6 +35,17 @@ input.compact-number::-webkit-inner-spin-button {
 }
 
 input.compact-number {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+input.no-spin::-webkit-outer-spin-button,
+input.no-spin::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+input.no-spin {
   appearance: textfield;
   -moz-appearance: textfield;
 }

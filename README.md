@@ -10,6 +10,60 @@ Esto inicia:
 - Frontend Vite (ejemplo `http://localhost:5117`)
 - API local (siempre en `http://localhost:4000`)
 
+## Servidor central 24/7 (Paso 1 multiusuario)
+
+Este modo deja una sola API central para que varias PCs consulten la misma base.
+
+### 1) En la PC servidor (la que tendra MySQL)
+
+Crear archivo `.env.server.local` (en la raiz del proyecto):
+
+```env
+HOST=0.0.0.0
+PORT=4000
+ERP_STORAGE=mysql
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=tu_password
+MYSQL_DATABASE=lds_agro_erp
+```
+
+### 2) Levantar la API central
+
+```bash
+npm run api:central
+```
+
+Verifica salud:
+
+- Local: `http://127.0.0.1:4000/api/health`
+- LAN: revisa la consola de la API, imprime `LAN: http://TU_IP:4000`
+
+### 3) Abrir firewall de Windows (si otras PCs no entran)
+
+PowerShell (Administrador):
+
+```powershell
+New-NetFirewallRule -DisplayName "LDS ERP API 4000" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 4000
+```
+
+### 4) En las PCs cliente
+
+Usar la URL del servidor:
+
+- `http://IP_DEL_SERVIDOR:4000/api/health`
+- `http://IP_DEL_SERVIDOR:4000/live/operaciones.csv`
+
+Si `api/health` responde `ok:true`, ya estan conectadas al servidor central.
+
+## Railway (nube, recomendado)
+
+Si quieres evitar una PC encendida 24/7, deploya API+MySQL en Railway.
+
+Guia completa:
+- [Deploy Railway](./docs/DEPLOY_RAILWAY.md)
+
 ## Excel en tiempo real
 
 La API genera CSV vivos en `data/live` y además expone endpoints web para Excel/Power BI.

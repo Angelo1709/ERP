@@ -1,9 +1,16 @@
 import { createServer } from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.PORT || 4000);
+const HOST = String(
+  process.env.HOST ||
+  process.env.ERP_HOST ||
+  (process.env.RAILWAY_ENVIRONMENT ? "0.0.0.0" : "127.0.0.1"),
+);
+const CORS_ORIGIN = String(process.env.CORS_ORIGIN || process.env.ERP_CORS_ORIGIN || "*").trim() || "*";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = path.resolve(process.env.ERP_DATA_DIR || path.resolve(__dirname, "..", "data"));
 const LIVE_DIR = path.join(DATA_DIR, "live");
@@ -237,8 +244,24 @@ function writeLiveFiles(data, updatedAt) {
   fs.writeFileSync(path.join(LIVE_DIR, "metadata.csv"), meta, "utf8");
 }
 
+function isWildcardHost(host) {
+  return host === "0.0.0.0" || host === "::";
+}
+
+function localIps() {
+  const nets = os.networkInterfaces();
+  const ips = [];
+  for (const list of Object.values(nets)) {
+    for (const addr of list || []) {
+      if (!addr || addr.internal) continue;
+      if (addr.family === "IPv4") ips.push(addr.address);
+    }
+  }
+  return Array.from(new Set(ips));
+}
+
 function setCors(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", CORS_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
@@ -302,12 +325,17 @@ const server = createServer(async (req, res) => {
     const pathname = url.pathname;
 
     if (req.method === "GET" && pathname === "/api/health") {
+      const lan = localIps().map((ip) => `http://${ip}:${PORT}`);
       return sendJson(res, 200, {
         ok: true,
+        host: HOST,
+        port: PORT,
+        cors: CORS_ORIGIN,
         storage: storageMode,
         db: DB_PATH,
         jsonState: STATE_JSON_PATH,
         liveDir: LIVE_DIR,
+        lan,
         mysql: storageMode === "mysql" ? {
           host: process.env.MYSQL_HOST || null,
           port: Number(process.env.MYSQL_PORT || 3306),
@@ -455,8 +483,18 @@ server.on("error", (err) => {
   throw err;
 });
 
-server.listen(PORT, () => {
-  console.log(`[erp-api] escuchando en http://localhost:${PORT}`);
+server.listen(PORT, HOST, () => {
+  const mainUrl = isWildcardHost(HOST) ? `http://127.0.0.1:${PORT}` : `http://${HOST}:${PORT}`;
+  console.log(`[erp-api] escuchando en ${mainUrl}`);
+  if (isWildcardHost(HOST)) {
+    const ips = localIps();
+    if (ips.length) {
+      console.log(`[erp-api] LAN: ${ips.map((ip) => `http://${ip}:${PORT}`).join(" | ")}`);
+    }
+  }
+  if (CORS_ORIGIN !== "*") {
+    console.log(`[erp-api] cors origin: ${CORS_ORIGIN}`);
+  }
   console.log(`[erp-api] storage: ${storageMode}`);
   if (storageMode === "mysql") {
     console.log(`[erp-api] mysql: ${process.env.MYSQL_HOST || "localhost"}:${process.env.MYSQL_PORT || "3306"} / ${process.env.MYSQL_DATABASE || "-"}`);
