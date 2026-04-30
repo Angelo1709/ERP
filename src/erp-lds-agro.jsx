@@ -652,6 +652,21 @@ const buildDifCambioNotaDraft = ({
   };
 };
 
+const tcCobroEfectivo = ({
+  tcCobro = 0,
+  moneda = "USD",
+  montoMoneda = 0,
+  totalAplicadoUSD = 0,
+} = {}) => {
+  const m = String(moneda || "").toUpperCase();
+  const usd = num(totalAplicadoUSD);
+  if ((m === "PESOS" || m === "ARS") && usd > 0.000001) {
+    const monto = num(montoMoneda);
+    if (monto > 0) return monto / usd;
+  }
+  return num(tcCobro) || 0;
+};
+
 const facturaCobradaUSD = (factura, recibos, facturas = [], productos = []) => {
   if (!factura || factura.anulado) return 0;
   const recibosActivos = filterActive(recibos);
@@ -2220,12 +2235,19 @@ function Operaciones({ data, onUpdate, navTarget, currentUser }) {
       ? normalizeReciboAplicaciones([{ facturaId: qRec.facturaId, montoUSD: moneyToUSD(monto, qRec.moneda, qRec.tc) }])
       : [];
     const montoUsdRecibo = moneyToUSD(monto, qRec.moneda, qRec.tc);
+    const totalAppsSaveUSD = apps.reduce((s, ap) => s + num(ap.montoUSD), 0);
+    const tcCobroSave = tcCobroEfectivo({
+      tcCobro: qRec.tc,
+      moneda: qRec.moneda,
+      montoMoneda: monto,
+      totalAplicadoUSD: totalAppsSaveUSD,
+    });
     const difCambioSugerida = sugerirDifCambioCobro({
       facturaRef: qRec.facturaId,
       aplicaciones: apps,
       montoUSD: montoUsdRecibo,
       moneda: qRec.moneda,
-      tcCobro: qRec.tc,
+      tcCobro: tcCobroSave,
       facturas,
       recibos,
       productos,
@@ -2234,10 +2256,10 @@ function Operaciones({ data, onUpdate, navTarget, currentUser }) {
     let difCambioEstado = difCambioSugerida?.estado || "sin_diferencia";
     let notaDifCambio = null;
     if (difCambioSugerida?.estado === "nota_sugerida") {
-      if (qRec.notaDifGenerar && !clienteId) {
+      if ((qRec.notaDifGenerar || qRec.notaDifPreparada) && !clienteId) {
         return alert("Para generar la nota sugerida, el recibo debe tener cliente.");
       }
-      if (qRec.notaDifGenerar && clienteId) {
+      if ((qRec.notaDifGenerar || qRec.notaDifPreparada) && clienteId) {
         const draft = buildDifCambioNotaDraft({
           sugerencia: difCambioSugerida,
           reciboId: recId,
@@ -2275,7 +2297,7 @@ function Operaciones({ data, onUpdate, navTarget, currentUser }) {
       concepto: qRec.concepto || "",
       monto,
       moneda: qRec.moneda,
-      tc: +qRec.tc,
+      tc: roundMoney(tcCobroSave, 6),
       tcFuente: qRec.tcFuente || "manual",
       tcFecha: qRec.tcFecha || null,
       tcId: qRec.tcId || null,
@@ -2994,12 +3016,19 @@ function Operaciones({ data, onUpdate, navTarget, currentUser }) {
             const appsPreview = qRec.facturaId && facturaExacta
               ? normalizeReciboAplicaciones([{ facturaId: qRec.facturaId, montoUSD: moneyToUSD(qRec.monto, qRec.moneda, qRec.tc) }])
               : [];
+            const totalAppsPreviewUSD = appsPreview.reduce((s, ap) => s + num(ap.montoUSD), 0);
+            const tcPreview = tcCobroEfectivo({
+              tcCobro: qRec.tc,
+              moneda: qRec.moneda,
+              montoMoneda: qRec.monto,
+              totalAplicadoUSD: totalAppsPreviewUSD,
+            });
             const difCambioPreview = sugerirDifCambioCobro({
               facturaRef: qRec.facturaId,
               aplicaciones: appsPreview,
               montoUSD: moneyToUSD(qRec.monto, qRec.moneda, qRec.tc),
               moneda: qRec.moneda,
-              tcCobro: qRec.tc,
+              tcCobro: tcPreview,
               facturas,
               recibos,
               productos,
@@ -4291,6 +4320,7 @@ function Recibos({ data, onUpdate, currentUser, onNavigate }) {
     }
 
     const {
+      notaDifPreparada,
       notaDifGenerar,
       notaDifMontoUSD,
       notaDifConcepto,
@@ -4300,7 +4330,12 @@ function Recibos({ data, onUpdate, currentUser, onNavigate }) {
       ...formBase,
       clienteId,
       monto,
-      tc: +form.tc,
+      tc: roundMoney(tcCobroEfectivo({
+        tcCobro: form.tc,
+        moneda: form.moneda,
+        montoMoneda: monto,
+        totalAplicadoUSD: aplicaciones.length ? totalAplicadoUSD : montoUSD,
+      }), 6),
       tcFuente: form.tcFuente || "manual",
       tcFecha: form.tcFecha || null,
       tcId: form.tcId || null,
@@ -4398,7 +4433,12 @@ function Recibos({ data, onUpdate, currentUser, onNavigate }) {
         aplicaciones,
         montoUSD: aplicaciones.length ? totalAplicadoUSD : montoUSD,
         moneda: rec.moneda,
-        tcCobro: rec.tc,
+        tcCobro: tcCobroEfectivo({
+          tcCobro: rec.tc,
+          moneda: rec.moneda,
+          montoMoneda: rec.monto,
+          totalAplicadoUSD: aplicaciones.length ? totalAplicadoUSD : montoUSD,
+        }),
         facturas,
         recibos,
         productos,
@@ -4406,10 +4446,10 @@ function Recibos({ data, onUpdate, currentUser, onNavigate }) {
       });
       let difCambioEstado = difCambioSugerida?.estado || "sin_diferencia";
       if (difCambioSugerida?.estado === "nota_sugerida") {
-        if (notaDifGenerar && !clienteId) {
+        if ((notaDifGenerar || notaDifPreparada) && !clienteId) {
           return alert("Para generar la nota sugerida, el recibo debe tener cliente.");
         }
-        if (notaDifGenerar && clienteId) {
+        if ((notaDifGenerar || notaDifPreparada) && clienteId) {
           const draft = buildDifCambioNotaDraft({
             sugerencia: difCambioSugerida,
             reciboId: rec.id,
@@ -4702,12 +4742,18 @@ function Recibos({ data, onUpdate, currentUser, onNavigate }) {
     ? num(form.aplicadoUSD)
     : aplicacionesForm.reduce((s, ap) => s + num(ap.montoUSD), 0);
   const totalAplicadoMoneda = usdToMoney(totalAplicadoUSD, form.moneda, form.tc);
+  const tcDifPreview = tcCobroEfectivo({
+    tcCobro: form.tc,
+    moneda: form.moneda,
+    montoMoneda: form.monto,
+    totalAplicadoUSD: aplicacionesForm.length ? totalAplicadoUSD : montoUSD,
+  });
   const difCambioPreview = sugerirDifCambioCobro({
     facturaRef: form.facturaId,
     aplicaciones: aplicacionesForm,
     montoUSD: aplicacionesForm.length ? totalAplicadoUSD : montoUSD,
     moneda: form.moneda,
-    tcCobro: form.tc,
+    tcCobro: tcDifPreview,
     facturas,
     recibos: recibosBase,
     productos,
